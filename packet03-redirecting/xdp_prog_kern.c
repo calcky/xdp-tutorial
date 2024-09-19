@@ -29,7 +29,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key,  unsigned char[ETH_ALEN]);
 	__type(value, unsigned char[ETH_ALEN]);
-	__uint(max_entries, 1);
+	__uint(max_entries, 10);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } redirect_params SEC(".maps");
 
@@ -228,6 +228,9 @@ out:
 static __always_inline int ip_decrease_ttl(struct iphdr *iph)
 {
 	/* Assignment 4: see samples/bpf/xdp_fwd_kern.c from the kernel */
+	__u32 check = iph->check;
+	check += bpf_htons(0x0100);
+	iph->check = (__u16)(check + (check >= 0xFFFF));
 	return --iph->ttl;
 }
 
@@ -326,7 +329,94 @@ int xdp_router_func(struct xdp_md *ctx)
 	}
 
 out:
+	bpf_printk("action: %d", action);
 	return xdp_stats_record_action(ctx, action);
+}
+
+/* Assignment 5: Complete this router tun program */
+SEC("xdp_tun")
+int xdp_router_tun_func(struct xdp_md *ctx)
+{
+    void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+    struct bpf_fib_lookup fib_params = {};
+    struct iphdr *iph;
+    __u64 nh_off;
+    int rc;
+    int action = XDP_PASS;
+
+	nh_off = sizeof(*iph);
+	if (data + nh_off > data_end) {
+		action = XDP_DROP;
+		goto out;
+	}
+
+    if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(struct ethhdr))) {
+        action = XDP_DROP;
+        goto out;
+    }
+	data_end = (void *)(long)ctx->data_end;
+    data = (void *)(long)ctx->data;
+    struct ethhdr *eth = data;
+
+	nh_off = sizeof(*eth);
+	if (data + nh_off > data_end) {
+		action = XDP_DROP;
+		goto out;
+	}
+
+	eth->h_proto = bpf_htons(ETH_P_IP);
+	iph = data + nh_off;
+
+	if (iph + 1 > data_end) {
+		action = XDP_DROP;
+		goto out;
+	}
+
+	if (iph->ttl <= 1)
+		goto out;
+
+	fib_params.family	= AF_INET;
+	fib_params.tos		= iph->tos;
+	fib_params.l4_protocol	= iph->protocol;
+	fib_params.sport	= 0;
+	fib_params.dport	= 0;
+	fib_params.tot_len	= bpf_ntohs(iph->tot_len);
+	fib_params.ipv4_src	= iph->saddr;
+	fib_params.ipv4_dst	= iph->daddr;
+	fib_params.ifindex = ctx->ingress_ifindex;
+	bpf_printk("input ifindex: %d", fib_params.ifindex);
+
+	rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+	switch (rc) {
+	case BPF_FIB_LKUP_RET_SUCCESS:         /* lookup successful */
+		ip_decrease_ttl(iph);
+
+		memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+		memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+		action = bpf_redirect(fib_params.ifindex, 0);
+		bpf_printk("output ifindex: %d", fib_params.ifindex);
+		bpf_printk("redirect: %d", action);
+		break;
+	case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
+	case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
+	case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
+		action = XDP_DROP;
+		//bpf_printk("drop: %d", action);
+		break;
+	case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
+	case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
+	case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
+	case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
+	case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
+		//bpf_printk("pass: %d", action);
+		/* PASS */
+		break;
+	}
+
+out:
+	//bpf_printk("action: %d, len: %d", action, data_end-data);
+	return action; //xdp_stats_record_action(ctx, action);
 }
 
 SEC("xdp")
